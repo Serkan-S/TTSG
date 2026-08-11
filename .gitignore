@@ -1,0 +1,9 @@
+node_modules/
+.claude/
+.env
+.env.local
+server.log
+*.log
+dump.rdb
+redis-portable/
+.vercel/

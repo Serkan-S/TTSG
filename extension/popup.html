@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8" />
+<title>TTSG Takip</title>
+<style>
+  body {
+    width: 300px;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+    padding: 14px;
+    color: #0b0b0b;
+  }
+  h1 { font-size: 14px; margin: 0 0 10px; }
+  .status {
+    font-size: 12px;
+    padding: 8px 10px;
+    border-radius: 6px;
+    margin-bottom: 10px;
+    background: #f2f2f0;
+  }
+  .status.ok { background: #e6f6ee; color: #0a6b3d; }
+  .status.warn { background: #fdeeea; color: #a3341c; }
+  label { font-size: 11px; color: #52514e; display: block; margin-bottom: 3px; }
+  input[type="text"] {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 6px 8px;
+    font-size: 12px;
+    border: 1px solid #d8d7d2;
+    border-radius: 6px;
+    margin-bottom: 10px;
+  }
+  button {
+    width: 100%;
+    padding: 9px;
+    font-size: 13px;
+    border: none;
+    border-radius: 6px;
+    background: #2a78d6;
+    color: #fff;
+    cursor: pointer;
+    margin-bottom: 8px;
+  }
+  button.secondary { background: #52514e; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  #progress {
+    margin-top: 10px;
+    font-size: 12px;
+    color: #52514e;
+    white-space: pre-line;
+  }
+</style>
+</head>
+<body>
+  <h1>TTSG Takip</h1>
+  <div id="loginStatus" class="status">Kontrol ediliyor…</div>
+
+  <label for="backendUrl">Sunucu Adresi</label>
+  <input type="text" id="backendUrl" placeholder="http://localhost:3000" />
+
+  <button id="scanBtn" type="button" disabled>Taramayı Başlat</button>
+  <button id="summaryBtn" class="secondary" type="button" disabled>Eksik Özetleri Getir</button>
+  <div id="progress"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
