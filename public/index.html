@@ -352,7 +352,7 @@
         <label for="cTitle">Yeni Şirket Unvanı</label>
         <input id="cTitle" type="text" placeholder="Tam ticaret unvanı (TTSG'deki ile birebir aynı olmalı)" required />
       </div>
-      <div class="field ms-field">
+      <div class="field ms-field" id="manualMudurlukField" style="display:none">
         <label for="cMudurlukBtn">Sicil Müdürlüğü (birden fazla seçilebilir)</label>
         <button type="button" class="ms-trigger" id="cMudurlukBtn">Seçiniz…</button>
         <div class="ms-panel" id="cMudurlukPanel" style="display:none">
@@ -365,7 +365,11 @@
         <input id="cTaxNumber" type="text" placeholder="" />
       </div>
       <div class="actions">
-        <button class="primary" type="submit">Şirket Ekle</button>
+        <button class="primary" type="submit" id="addCompanySubmit">Şirket Ekle</button>
+      </div>
+      <div class="field grow" style="font-size:12px;color:var(--text-secondary);display:flex;align-items:center;gap:10px">
+        <span id="extBadge">Eklenti kontrol ediliyor…</span>
+        <button type="button" class="ghost" id="toggleManualBtn" style="display:none;padding:4px 10px;font-size:12px">Elle seç</button>
       </div>
       <div id="addCompanyMsg" style="font-size:12px;color:var(--text-secondary);width:100%"></div>
     </form>
@@ -490,6 +494,90 @@
     initMudurlukMultiselect(meta.sicilMudurlukleri || []);
   }
 
+  // --- Eklenti köprüsü (extension/content.js) ---
+  // Dashboard TTSG oturum çerezine hiçbir zaman doğrudan erişemez (same-origin
+  // kısıtı); sicil müdürlüğü otomatik tespiti için content script üzerinden
+  // eklentiyle window.postMessage ile konuşur. Eklenti kurulu/bağlı değilse
+  // (PING'e 1.5 sn içinde READY gelmezse) elle seçim akışına geri düşer.
+  let extConnected = false;
+  let manualMode = false;
+  let reqCounter = 0;
+  const nextRequestId = () => `req${++reqCounter}`;
+
+  function setManualMode(on) {
+    manualMode = on;
+    el('manualMudurlukField').style.display = on ? 'flex' : 'none';
+    el('toggleManualBtn').textContent = on ? 'Otomatik tespite dön' : 'Elle seç';
+  }
+
+  function updateExtBadge() {
+    const badge = el('extBadge');
+    const toggleBtn = el('toggleManualBtn');
+    if (extConnected) {
+      badge.textContent = '✓ Eklenti bağlı — sicil müdürlüğü otomatik tespit edilecek';
+      toggleBtn.style.display = '';
+      setManualMode(false);
+    } else {
+      badge.textContent = '⚠ Eklenti bulunamadı — sicil müdürlüğünü elle seçin';
+      toggleBtn.style.display = 'none';
+      setManualMode(true);
+    }
+  }
+
+  function initExtensionBridge() {
+    let settled = false;
+
+    window.addEventListener('message', (event) => {
+      if (event.source !== window) return;
+      const msg = event.data;
+      if (!msg || msg.source !== 'ttsg-extension' || msg.type !== 'READY' || settled) return;
+      settled = true;
+      extConnected = true;
+      updateExtBadge();
+    });
+
+    window.postMessage({ source: 'ttsg-dashboard', type: 'PING', requestId: nextRequestId() }, window.location.origin);
+
+    setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      extConnected = false;
+      updateExtBadge();
+    }, 1500);
+
+    el('toggleManualBtn').addEventListener('click', () => setManualMode(!manualMode));
+  }
+
+  // Bir kerelik tespit isteği gönderir; ilerleme mesajlarını addCompanyMsg'ye
+  // yazar, sonuç (DETECT_RESULT) geldiğinde promise'i çözer.
+  function detectAndAddViaExtension(title) {
+    return new Promise((resolve, reject) => {
+      const requestId = nextRequestId();
+      const handler = (event) => {
+        if (event.source !== window) return;
+        const msg = event.data;
+        if (!msg || msg.source !== 'ttsg-extension' || msg.requestId !== requestId) return;
+        if (msg.type === 'DETECT_PROGRESS') {
+          el('addCompanyMsg').textContent = msg.text || '';
+          return;
+        }
+        if (msg.type === 'DETECT_RESULT') {
+          window.removeEventListener('message', handler);
+          if (msg.status === 'error') {
+            reject(new Error(msg.text || 'Tespit sırasında hata oluştu.'));
+          } else {
+            resolve(msg);
+          }
+        }
+      };
+      window.addEventListener('message', handler);
+      window.postMessage(
+        { source: 'ttsg-dashboard', type: 'DETECT_AND_ADD_COMPANY', requestId, title, backendUrl: window.location.origin },
+        window.location.origin
+      );
+    });
+  }
+
   // --- Sicil Müdürlüğü çoklu seçim (tıklanınca açılan panel) ---
   const selectedMudurlukIds = new Set();
 
@@ -559,10 +647,45 @@
     e.preventDefault();
     const msg = el('addCompanyMsg');
     const title = el('cTitle').value.trim();
-    const sicilMudurlukleri = Array.from(selectedMudurlukIds);
     const taxNumber = el('cTaxNumber').value.trim();
 
-    if (!title || sicilMudurlukleri.length === 0) {
+    if (!title) {
+      msg.textContent = 'Şirket unvanı zorunludur.';
+      return;
+    }
+
+    if (extConnected && !manualMode) {
+      const submitBtn = el('addCompanySubmit');
+      submitBtn.disabled = true;
+      msg.textContent = 'Tespit ediliyor…';
+      try {
+        const result = await detectAndAddViaExtension(title);
+        if (result.found) {
+          const registryNames = result.registries.map((r) => r.name).join(', ');
+          msg.textContent = `"${result.company.title}" eklendi. Sicil müdürlüğü: ${registryNames}`;
+          el('addCompanyForm').reset();
+          resetMudurlukSelection();
+          await Promise.all([loadStats(), loadCompanies()]);
+        } else if (result.partialMatches && result.partialMatches.length > 0) {
+          const suggestions = result.partialMatches
+            .slice(0, 3)
+            .map((m) => `"${m.foundTitles[0]}" (${m.name})`)
+            .join(' | ');
+          msg.textContent = `Tam eşleşme bulunamadı, yakın unvanlar: ${suggestions}. Unvanı kontrol edip tekrar deneyin.`;
+        } else {
+          msg.textContent = "TTSG'de bu unvanla kayıtlı bir ilan bulunamadı.";
+        }
+      } catch (err) {
+        msg.textContent = `Hata: ${err.message}`;
+      } finally {
+        submitBtn.disabled = false;
+      }
+      return;
+    }
+
+    // Elle mod (veya eklenti bağlı değil): mevcut manuel akış, değişmedi.
+    const sicilMudurlukleri = Array.from(selectedMudurlukIds);
+    if (sicilMudurlukleri.length === 0) {
       msg.textContent = 'En az bir Sicil Müdürlüğü seçmelisiniz.';
       return;
     }
@@ -780,6 +903,7 @@
   if (savedTheme) document.documentElement.setAttribute('data-theme', savedTheme);
 
   (async function init() {
+    initExtensionBridge();
     await loadMeta();
     await Promise.all([loadStats(), loadEvents(), loadCompanies()]);
   })();

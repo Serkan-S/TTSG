@@ -3,6 +3,7 @@ const { supabase } = require('../../config/db');
 const { createCompany } = require('../../repositories/companyRepository');
 const {
   searchBatch,
+  detectCompanyRegistries,
   processPdfEntry,
   enrichEventByGuid,
   enrichEventByGuidFromImage,
@@ -202,6 +203,37 @@ router.post('/scan/search', async (req, res) => {
   } catch (err) {
     console.error(`[POST /api/scan/search] ${err.message}`);
     res.status(500).json({ error: `Arama sirasinda hata olustu: ${err.message}` });
+  }
+});
+
+// POST /api/scan/detect-company - bir unvanin TTSG'deki hangi sicil
+// muduerluklerinde kayitli oldugunu (ve hic kayitli olup olmadigini) tespit
+// eder. Sirket eklerken kullaniciyi ~140 sicil muduerluegue arasindan elle
+// secim yapmaya zorlamak yerine dashboard/eklenti tarafindan cagirilir.
+// Tek istekte TUM liste degil, offset/limit ile bir dilim taranir; cagiran
+// taraf `done: true` donene kadar bir sonraki offset ile tekrar cagirmalidir.
+router.post('/scan/detect-company', async (req, res) => {
+  try {
+    const { unvan, cookie, offset, limit } = req.body || {};
+
+    if (!unvan || typeof unvan !== 'string') {
+      return res.status(400).json({ error: 'unvan alani zorunludur.' });
+    }
+    if (!cookie || typeof cookie !== 'string') {
+      return res.status(400).json({ error: 'cookie alani zorunludur (TTSG oturum cerezi).' });
+    }
+
+    const result = await detectCompanyRegistries({
+      unvan,
+      cookie,
+      offset: Number(offset) || 0,
+      limit: Math.min(Number(limit) || 10, 20),
+    });
+
+    res.json(result);
+  } catch (err) {
+    console.error(`[POST /api/scan/detect-company] ${err.message}`);
+    res.status(500).json({ error: `Sicil muduerluegue tespiti sirasinda hata olustu: ${err.message}` });
   }
 });
 

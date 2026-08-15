@@ -5,6 +5,7 @@ const { extractEvents, classifyIlanTuru } = require('./eventParserService');
 const { summarizeAnnouncement, summarizeAnnouncementFromImage } = require('./summaryService');
 const { fetchPdfViaBrowser } = require('./browserPdfService');
 const { renderPdfFirstPageAsImage } = require('./pdfRenderService');
+const { SICIL_MUDURLUKLERI } = require('../data/sicilMudurlukleri');
 const {
   getActiveCompanies,
   countActiveCompanies,
@@ -39,6 +40,14 @@ const MIN_TEXT_LENGTH_FOR_SUMMARY = 40;
 // sayilip kuyruga girmesin diye, sadece sirketin eklendigi (izlenmeye
 // baslandigi) tarihten bu kadar oncesine kadar olan ilanlar dikkate alinir.
 const HISTORY_WINDOW_DAYS = Number(process.env.SCAN_HISTORY_WINDOW_DAYS) || 7;
+
+// Sicil muduerluegue tespiti (detectCompanyRegistries) tek bir sirket icin TUM
+// sicil muduerluklerini (~140) tarar. Bu, SCAN_MIN/MAX_DELAY_MS'nin hedeflendigi
+// "onlarca sirket, haftalik tekrar eden" senaryosundan farkli: kullanici tetikli,
+// TEK seferlik, TEK sirket icin calisir - o yuzden daha kisa bir gecikme kullanilir
+// (yoksa 140 istek x 2sn ~ 5 dk surer).
+const DETECT_MIN_DELAY_MS = Number(process.env.DETECT_MIN_DELAY_MS) || 300;
+const DETECT_MAX_DELAY_MS = Number(process.env.DETECT_MAX_DELAY_MS) || 700;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -143,6 +152,74 @@ async function findNewEntriesForCompany(company, cookie) {
     remainingBacklog: allNewEntries.length - newEntries.length,
     savedCount: savedEntries.length,
     entries: savedEntries,
+  };
+}
+
+/**
+ * Bir unvanin TTSG'deki TUM sicil muduerluklerinden hangilerinde kayitli
+ * oldugunu tespit eder. Sirket eklenirken kullaniciyi elle ~140 sicil
+ * muduerluegue arasindan secim yapmaya zorlamak yerine, unvani her muduerlukte
+ * ayri ayri aratip (searchAnnouncements() - CAPTCHA'siz, guvenilir arama
+ * uc noktasi) nerede sonuc ciktigini toplar. Ayni zamanda "TTSG'de boyle bir
+ * sirket var mi" sorusunu da cevaplar: hicbir muduerlukte sonuc yoksa unvan
+ * TTSG'de kayitli degildir.
+ *
+ * Vercel'in tek istek suresi sinirina uymak icin (bkz. searchBatch), tum
+ * liste tek seferde degil offset/limit ile parcalar halinde taranir; cagiran
+ * taraf (extension/background.js) `done: true` donene kadar tekrar cagirir.
+ *
+ * @param {{ unvan: string, cookie: string, offset?: number, limit?: number }} params
+ */
+async function detectCompanyRegistries({ unvan, cookie, offset = 0, limit = 10 }) {
+  if (!unvan || unvan.trim().length < 5) {
+    throw new Error('[scanService.detectCompanyRegistries] unvan en az 5 karakter olmalidir.');
+  }
+  if (!cookie) {
+    throw new Error('[scanService.detectCompanyRegistries] TTSG oturum cerezi (cookie) zorunludur.');
+  }
+
+  const normalizedTitle = unvan.toLocaleUpperCase('tr-TR').trim();
+  const slice = SICIL_MUDURLUKLERI.slice(offset, offset + limit);
+
+  const exactMatches = [];
+  const partialMatches = [];
+
+  for (let i = 0; i < slice.length; i += 1) {
+    const registry = slice[i];
+    try {
+      // eslint-disable-next-line no-await-in-loop
+      const results = await searchAnnouncements({ sicilMudurluguId: registry.id, unvan, cookie });
+
+      if (results.length > 0) {
+        const exactCount = results.filter(
+          (r) => r.unvan.toLocaleUpperCase('tr-TR').trim() === normalizedTitle
+        ).length;
+
+        if (exactCount > 0) {
+          exactMatches.push({ id: registry.id, name: registry.name, sampleCount: exactCount });
+        } else {
+          const foundTitles = [...new Set(results.map((r) => r.unvan))].slice(0, 5);
+          partialMatches.push({ id: registry.id, name: registry.name, foundTitles });
+        }
+      }
+    } catch (err) {
+      console.error(`[scanService] "${unvan}" / ${registry.name} tespiti basarisiz: ${err.message}`);
+    }
+
+    if (i < slice.length - 1) {
+      // eslint-disable-next-line no-await-in-loop
+      await sleep(randomDelayMs(DETECT_MIN_DELAY_MS, DETECT_MAX_DELAY_MS));
+    }
+  }
+
+  return {
+    offset,
+    limit,
+    processed: slice.length,
+    totalRegistries: SICIL_MUDURLUKLERI.length,
+    done: offset + slice.length >= SICIL_MUDURLUKLERI.length,
+    exactMatches,
+    partialMatches,
   };
 }
 
@@ -344,6 +421,7 @@ async function enrichEventByGuidViaBrowser({ pdfGuid, cookie }) {
 
 module.exports = {
   searchBatch,
+  detectCompanyRegistries,
   processPdfEntry,
   enrichEventByGuid,
   enrichEventByGuidFromImage,

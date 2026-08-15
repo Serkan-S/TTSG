@@ -3,7 +3,7 @@
   "name": "TTSG Takip - Tarama Tetikleyici",
   "version": "1.0.0",
   "description": "TTSG oturumunuzu kullanarak takip ettiginiz sirketler icin taramayi baslatir.",
-  "permissions": ["cookies", "storage"],
+  "permissions": ["cookies", "storage", "alarms"],
   "host_permissions": [
     "*://*.ticaretsicil.gov.tr/*",
     "http://localhost:3000/*",
@@ -14,5 +14,12 @@
   },
   "background": {
     "service_worker": "background.js"
-  }
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://localhost:3000/*", "https://*.vercel.app/*"],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ]
 }

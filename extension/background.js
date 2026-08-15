@@ -24,6 +24,48 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+// MV3 service worker'i ~30sn hareketsizlikte Chrome tarafindan sonlandiriliyor.
+// runScan/fetchMissingSummaries icindeki sleep() bekleme adimlari (10-20sn)
+// sirasinda tek basina setTimeout bu kapanmayi ENGELLEMEZ; worker o sirada
+// oldurulurse bekleyen timeout hicbir zaman tetiklenmez ve dongu sonsuza
+// kadar "…alınıyor" durumunda takili kalir. chrome.alarms periyodik
+// tetiklemesi gercek bir extension event'i oldugu icin worker'i canli tutar.
+const KEEP_ALIVE_ALARM = 'ttsg-keep-alive';
+
+function startKeepAlive() {
+  try {
+    chrome.alarms.create(KEEP_ALIVE_ALARM, { periodInMinutes: 0.4 });
+  } catch (err) {
+    console.error('[TTSG Takip] keep-alive alarm baslatilamadi:', err.message);
+  }
+}
+
+function stopKeepAlive() {
+  try {
+    chrome.alarms.clear(KEEP_ALIVE_ALARM);
+  } catch (err) {
+    console.error('[TTSG Takip] keep-alive alarm durdurulamadi:', err.message);
+  }
+}
+
+try {
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm.name === KEEP_ALIVE_ALARM) {
+      // no-op: sadece tetiklenmesi worker'in inaktivite sayacini sifirlar.
+    }
+  });
+} catch (err) {
+  // Bu satir eskiden try/catch DISINDAYDI: chrome.alarms herhangi bir
+  // sebeple tanimsizsa (ör. "alarms" izni yuklenmemis bir eklenti
+  // reload'unda gecici olarak eksikse) burada firlatilan hata TUM
+  // background.js'in geri kalanini (asagidaki chrome.runtime.onMessage
+  // kaydi DAHIL) calismadan birakiyordu - sonuc: content.js'ten gelen
+  // HICBIR mesaja (START_SCAN, DETECT_AND_ADD_COMPANY, ...) yanit
+  // gelmiyor, "message port closed before a response was received"
+  // disinda hicbir iz kalmiyordu.
+  console.error('[TTSG Takip] chrome.alarms.onAlarm dinleyicisi eklenemedi:', err.message);
+}
+
 function randomDelay(min, max) {
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
@@ -37,6 +79,29 @@ async function getCookieHeader() {
 
 function setProgress(state) {
   return chrome.storage.local.set({ scanState: state });
+}
+
+// "Sirket Ekle" otomatik tespiti dashboard'dan (content.js koeprusu
+// uezerinden) tetiklenir; popup'in scanState'inden bagimsizdir - ilerleme
+// chrome.storage.local yerine dogrudan istegi baslatan taba yollanir. Tab
+// bu sirada kapanmis/baska sayfaya gitmis olabilir, o yuzden sessizce yutulur.
+function sendToTab(tabId, message) {
+  if (!tabId) return;
+  try {
+    chrome.tabs.sendMessage(tabId, message, () => {
+      void chrome.runtime.lastError;
+    });
+  } catch (err) {
+    console.error('[TTSG Takip] mesaj tab\'a iletilemedi:', err.message);
+  }
+}
+
+function pushDetectProgress(tabId, requestId, state) {
+  sendToTab(tabId, { type: 'DETECT_PROGRESS', requestId, ...state });
+}
+
+function pushDetectResult(tabId, requestId, state) {
+  sendToTab(tabId, { type: 'DETECT_RESULT', requestId, ...state });
 }
 
 async function getBackendUrl() {
@@ -58,6 +123,7 @@ async function runScan(backendUrl) {
 
   await setProgress({ status: 'running', text: 'Şirketler taranıyor…', lines: [] });
 
+  startKeepAlive();
   try {
     while (!done) {
       // eslint-disable-next-line no-await-in-loop
@@ -97,6 +163,8 @@ async function runScan(backendUrl) {
     });
   } catch (err) {
     await setProgress({ status: 'error', text: `Hata: ${err.message}`, lines: summaryLines.slice() });
+  } finally {
+    stopKeepAlive();
   }
 }
 
@@ -123,6 +191,7 @@ async function fetchMissingSummaries(backendUrl) {
   const lines = [];
   await setProgress({ status: 'running', text: 'Eksik özetler getiriliyor…', lines: [] });
 
+  startKeepAlive();
   try {
     const cookie = await getCookieHeader();
     if (!cookie) {
@@ -182,13 +251,124 @@ async function fetchMissingSummaries(backendUrl) {
     await setProgress({ status: 'done', text: `Tamamlandı (${items.length} ilan denendi).`, lines });
   } catch (err) {
     await setProgress({ status: 'error', text: `Hata: ${err.message}`, lines });
+  } finally {
+    stopKeepAlive();
   }
 }
 
-chrome.runtime.onMessage.addListener((msg) => {
+// --- Dashboard'daki "Şirket Ekle" formunun otomatik sicil müdürlüğü tespiti ---
+// content.js koeprusu uezerinden tetiklenir. TTSG'de unvanin TUM sicil
+// muduerluklerinde aranmasi (backend'in /api/scan/detect-company'i offset
+// bazli parcalar halinde donmesi) tek seferde bitmeyecegi icin runScan()'daki
+// gibi bir dongude cagirilir; sonuc birikimli toplanir.
+async function detectAndAddCompany({ title, backendUrl, tabId, requestId }) {
+  const cookie = await getCookieHeader();
+  if (!cookie) {
+    pushDetectResult(tabId, requestId, { status: 'error', text: 'TTSG oturum çerezi bulunamadı.' });
+    return;
+  }
+
+  let offset = 0;
+  let done = false;
+  let totalRegistries = '?';
+  const exactMatches = [];
+  const partialMatches = [];
+
+  startKeepAlive();
+  try {
+    while (!done) {
+      // eslint-disable-next-line no-await-in-loop
+      const res = await fetch(`${backendUrl}/api/scan/detect-company`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ unvan: title, cookie, offset, limit: 10 }),
+      });
+      // eslint-disable-next-line no-await-in-loop
+      const json = await res.json();
+      if (!res.ok) {
+        throw new Error(json.error || `Sunucu hatasi (${res.status})`);
+      }
+
+      totalRegistries = json.totalRegistries;
+      offset += json.processed;
+      done = json.done || json.processed === 0;
+      exactMatches.push(...json.exactMatches);
+      partialMatches.push(...json.partialMatches);
+
+      pushDetectProgress(tabId, requestId, {
+        status: 'running',
+        text: `Sicil müdürlükleri taranıyor… ${offset}/${totalRegistries}`,
+      });
+    }
+
+    if (exactMatches.length > 0) {
+      // eslint-disable-next-line no-await-in-loop
+      const createRes = await fetch(`${backendUrl}/api/companies`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title, sicilMudurlukleri: exactMatches.map((m) => m.id) }),
+      });
+      const createJson = await createRes.json();
+      if (!createRes.ok) {
+        throw new Error(createJson.error || `Sunucu hatasi (${createRes.status})`);
+      }
+
+      pushDetectResult(tabId, requestId, {
+        status: 'done',
+        found: true,
+        company: createJson.data,
+        registries: exactMatches,
+      });
+    } else if (partialMatches.length > 0) {
+      pushDetectResult(tabId, requestId, { status: 'done', found: false, partialMatches });
+    } else {
+      pushDetectResult(tabId, requestId, { status: 'done', found: false, partialMatches: [] });
+    }
+  } catch (err) {
+    pushDetectResult(tabId, requestId, { status: 'error', text: `Hata: ${err.message}` });
+  } finally {
+    stopKeepAlive();
+  }
+}
+
+// Service worker her (yeniden) baslatildiginda bellekteki her turlu calisma
+// kaybolur; bu yuzden storage'da "running" olarak kalmis bir durum kesinlikle
+// bayattir (ör. eklenti reload edildiginde onceki calisma yarida kesildi) ve
+// butonlarin sonsuza kadar devre disi kalmasina neden olur. Baslangicta
+// temizleyip kullaniciya tekrar deneme imkani veriyoruz.
+chrome.storage.local.get('scanState', (stored) => {
+  if (stored.scanState && stored.scanState.status === 'running') {
+    setProgress({
+      status: 'error',
+      text: 'Önceki işlem uzantı yeniden yüklendiği için yarıda kesildi. Tekrar deneyin.',
+      lines: stored.scanState.lines || [],
+    });
+  }
+});
+
+chrome.runtime.onMessage.addListener((msg, sender) => {
   if (msg && msg.type === 'START_SCAN') {
     runScan(msg.backendUrl);
   } else if (msg && msg.type === 'FETCH_MISSING_SUMMARIES') {
     fetchMissingSummaries(msg.backendUrl);
+  } else if (msg && msg.type === 'DETECT_AND_ADD_COMPANY' && sender.tab) {
+    // Sadece content.js koeprusunden (dashboard sekmesinden) gelen istekler
+    // kabul edilir - sender.tab yoksa (ör. popup) bu akis anlamsizdir.
+    // detectAndAddCompany() reddederse (ör. getCookieHeader() try/catch
+    // disinda oldugu icin) .catch() olmadan bu bir "unhandled rejection"
+    // olarak sessizce kaybolur ve sayfa sonsuza kadar "Tespit ediliyor…"
+    // durumunda takili kalir - kullaniciya hicbir hata gostermez.
+    detectAndAddCompany({
+      title: msg.title,
+      backendUrl: msg.backendUrl,
+      tabId: sender.tab.id,
+      requestId: msg.requestId,
+    }).catch((err) => {
+      console.error('[TTSG Takip] detectAndAddCompany beklenmeyen hata:', err);
+      pushDetectResult(sender.tab.id, msg.requestId, {
+        status: 'error',
+        text: `Beklenmeyen hata: ${err.message}`,
+      });
+    });
   }
 });
